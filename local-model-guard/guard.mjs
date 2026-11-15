@@ -18,6 +18,12 @@
 //    in this request, so no write is replayed (pi-local-harness task 370).
 // 8. Early compaction (agent_end): after a turn that passes a share of the context window, the
 //    session is compacted once, keeping the open work (pi-local-harness task 116).
+// 10. Cut-off replies (agent_before_settle): a stream that ends without a finish reason and
+//    without a usable answer or tool call (gpt-oss on Ollama does this after a burst of
+//    reasoning) is continued at once with a short note ("call a tool with valid JSON, or answer"),
+//    instead of pi's retry after an exponential backoff (2 s, 4 s, 8 s) of the same request.
+//    Bounded by PI_GUARD_CUTOFF_RETRIES (default 3) per request; PI_GUARD_CUTOFF=off disables it.
+//    From rich-ai-chat's chat-attempt layer.
 // 9. Model profiles, switched on by model id (see PROFILES). gpt-oss: an opt-in reasoning effort when pi's
 //    thinking is off (PI_GUARD_GPT_OSS_EFFORT; pi sends none, so Ollama uses medium), the working folder's files in the system
 //    prompt (it opened every agentic-v1 task by reading "" as a file), and a hint when read is given
@@ -32,6 +38,9 @@ const TOOL_JSON_NUDGE = "The server returned incomplete tool JSON or another JSO
 const COMPACT_NOTE = "Keep the open work: what the person asked for, decisions made, files touched, and what is left to do. Drop finished detail.";
 const TEMPLATE_TOKENS = /<channel\|>|<\|[^<>\n]*\|>/g;
 const BROKEN_TOOL_JSON = /error parsing tool call:[\s\S]*(?:unexpected end of JSON input|invalid character\b|invalid escape\b|invalid unicode\b)/i;
+const CUT_OFF = /without finish_reason/i;
+const CUT_OFF_NUDGE = "Your last reply was cut off before any answer or tool call. Continue now: if you meant to use a tool, " +
+  "call one of the available tools with valid JSON arguments; otherwise give the answer directly. Keep the reasoning short.";
 const READS = new Set(["read", "grep", "find", "ls"]);
 const ENTRY = "local-model-guard";
 
@@ -84,6 +93,8 @@ export function options(env = process.env) {
     loopWatch: env.PI_GUARD_LOOP_WATCH !== "off",
     stripTokens: env.PI_GUARD_STRIP_TOKENS !== "off",
     toolJsonRetry: env.PI_GUARD_TOOL_JSON_RETRY !== "off",
+    cutoff: env.PI_GUARD_CUTOFF !== "off",
+    cutoffRetries: num("PI_GUARD_CUTOFF_RETRIES", 3),
     compactAt: Math.min(num("PI_GUARD_COMPACT_AT", 0.6), 1),
     profiles: env.PI_GUARD_PROFILE !== "off",
     // reasoning_effort for gpt-oss when pi's thinking is off: low, medium, high, or "default" to send none
@@ -98,7 +109,8 @@ const thinkingOf = message => (message.content || []).filter(c => c?.type === "t
 const callsOf = message => (message.content || []).filter(c => c?.type === "toolCall");
 
 export function installLocalModelGuard(pi, opts = options(), { now = () => Date.now(), timers = globalThis } = {}) {
-  const stats = { adjusted: 0, repaired: 0, nudged: 0, stalls: 0, loops: 0, stripped: 0, compacted: 0, stopped: 0, listed: 0, hinted: 0 };
+  const stats = { adjusted: 0, repaired: 0, nudged: 0, stalls: 0, loops: 0, stripped: 0, compacted: 0, stopped: 0, listed: 0, hinted: 0, cutoffs: 0 };
+  let cutoff = false, cutoffRetries = 0;
   let nudges = 0, lastKind = null, resending = false, stalled = null, watch = null, timer = null, seq = 0;
   let thoughts = createReasoningWatch(), brokenJson = false, mutated = false, compacted = false;
 
@@ -115,7 +127,7 @@ export function installLocalModelGuard(pi, opts = options(), { now = () => Date.
   // A new request from the person resets the nudge budget; the guard's own follow-ups do not.
   pi.on("before_agent_start", () => {
     if (resending) resending = false;
-    else { nudges = 0; mutated = false; }
+    else { nudges = 0; mutated = false; cutoffRetries = 0; }
     lastKind = null;
   });
   pi.on("agent_start", () => { thoughts = createReasoningWatch(); brokenJson = false; compacted = false; });
@@ -189,6 +201,7 @@ export function installLocalModelGuard(pi, opts = options(), { now = () => Date.
     if (message?.role !== "assistant") return undefined;
     clearTimer(); watch = null;
     brokenJson = message.stopReason === "error" && BROKEN_TOOL_JSON.test(String(message.errorMessage || ""));
+    cutoff = message.stopReason === "error" && CUT_OFF.test(String(message.errorMessage || "")) && callsOf(message).length === 0;
     if (opts.stripTokens) {
       let count = 0;
       const content = (message.content || []).map(c => c?.type === "text" && typeof c.text === "string"
@@ -213,6 +226,14 @@ export function installLocalModelGuard(pi, opts = options(), { now = () => Date.
 
   pi.on("agent_before_settle", (event, ctx) => {
     if (event?.continue) return undefined;
+    if (event?.outcome === "error" && cutoff && opts.cutoff) {
+      cutoff = false;
+      // Nothing ran in the cut-off turn (no tool call came through), so asking again is safe.
+      if (cutoffRetries >= opts.cutoffRetries) { stats.stopped++; record("out-of-cutoff-retries", ctx, {}); return undefined; }
+      cutoffRetries++; stats.cutoffs++;
+      record("cutoff", ctx, { retry: cutoffRetries });
+      return { entries: [...(event.entries || []), { type: "custom_message", customType: ENTRY, content: CUT_OFF_NUDGE, display: true }], continue: true };
+    }
     if (event?.outcome === "error" && brokenJson && opts.toolJsonRetry) {
       brokenJson = false;
       if (mutated) { record("not-retried", ctx, { reason: "broken tool JSON after a change" }); return undefined; }

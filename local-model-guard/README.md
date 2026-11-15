@@ -62,6 +62,8 @@ Environment variables:
 | `PI_GUARD_LOOP_WATCH` | on | `off` turns the reasoning-loop watch off |
 | `PI_GUARD_STRIP_TOKENS` | on | `off` keeps leaked template tokens |
 | `PI_GUARD_TOOL_JSON_RETRY` | on | `off` does not retry a tool call the server could not parse |
+| `PI_GUARD_CUTOFF` | on | `off` leaves cut-off replies (no finish reason, no answer or tool call) to pi's retry with backoff |
+| `PI_GUARD_CUTOFF_RETRIES` | 3 | how many times one request continues at once after a cut-off |
 | `PI_GUARD_COMPACT_AT` | `0.6` | Compact after a turn that passes this share of the context window (`0` turns it off) |
 | `PI_GUARD_PROFILE` | on | `off` turns model profiles off |
 | `PI_GUARD_GPT_OSS_EFFORT` | (none) | gpt-oss reasoning effort when pi's thinking is off: `low`, `medium`, `high`; unset or `default` sends none |

@@ -218,3 +218,39 @@ test("gpt-oss: read on a folder gets a hint to list it with bash", async () => {
   assert.equal(await emit("tool_result", { ...ev, isError: false }, gpt), undefined);
   assert.equal(profileFor("gpt-oss:20b").id, "gpt-oss");
 });
+
+test("a cut-off reply (gpt-oss: thinking, then no finish reason) is continued at once, up to the limit", async () => {
+  const cut = { role: "assistant", content: [{ type: "thinking", thinking: "I should read the config file first." }], stopReason: "error", errorMessage: "Stream ended without finish_reason" };
+  const { pi, emit } = fakePi();
+  installLocalModelGuard(pi, { ...opts, cutoffRetries: 2 });
+  await emit("before_agent_start");
+  await emit("agent_start");
+  // An earlier write in the same request does not block it: nothing ran in the cut-off turn.
+  await emit("tool_execution_start", { toolName: "write" }, ctx);
+  for (const _ of [1, 2]) {
+    await emit("message_end", { message: cut }, ctx);
+    const out = await settle(emit, { outcome: "error" });
+    assert.equal(out.continue, true);
+    assert.match(out.entries.at(-1).content, /cut off before any answer or tool call/);
+  }
+  await emit("message_end", { message: cut }, ctx);
+  assert.equal(await settle(emit, { outcome: "error" }), undefined, "out of retries: pi's own handling takes over");
+
+  // The budget resets for the next request.
+  await emit("before_agent_start");
+  await emit("message_end", { message: cut }, ctx);
+  assert.equal((await settle(emit, { outcome: "error" })).continue, true);
+
+  // Other errors are left to pi, and so is a cut-off that already carried a tool call.
+  await emit("message_end", { message: { ...cut, errorMessage: "connection refused" } }, ctx);
+  assert.equal(await settle(emit, { outcome: "error" }), undefined);
+  await emit("message_end", { message: { ...cut, content: [{ type: "toolCall", id: "t", name: "read", arguments: { path: "a" } }] } }, ctx);
+  assert.equal(await settle(emit, { outcome: "error" }), undefined);
+
+  // Off switch.
+  const off = fakePi();
+  installLocalModelGuard(off.pi, { ...opts, cutoff: false });
+  await off.emit("before_agent_start");
+  await off.emit("message_end", { message: cut }, ctx);
+  assert.equal(await settle(off.emit, { outcome: "error" }), undefined);
+});
