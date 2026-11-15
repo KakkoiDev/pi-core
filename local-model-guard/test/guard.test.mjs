@@ -254,3 +254,16 @@ test("a cut-off reply (gpt-oss: thinking, then no finish reason) is continued at
   await off.emit("message_end", { message: cut }, ctx);
   assert.equal(await settle(off.emit, { outcome: "error" }), undefined);
 });
+
+test("gpt-oss auto effort: low for a quick reply, default once a tool has run in the request", async () => {
+  const oss = { ...ctx, model: { provider: "ollama", id: "gpt-oss:20b" } };
+  const { pi, emit } = fakePi();
+  installLocalModelGuard(pi, { ...opts, gptOssEffort: "auto" });
+  await emit("before_agent_start");
+  assert.equal((await emit("before_provider_request", { payload: { model: "gpt-oss:20b" } }, oss)).reasoning_effort, "low");
+  await emit("tool_execution_start", { toolName: "read" }, oss);
+  const after = await emit("before_provider_request", { payload: { model: "gpt-oss:20b" } }, oss);
+  assert.equal(after?.reasoning_effort, undefined, "default effort: none sent");
+  await emit("before_agent_start"); // next request starts low again
+  assert.equal((await emit("before_provider_request", { payload: { model: "gpt-oss:20b" } }, oss)).reasoning_effort, "low");
+});

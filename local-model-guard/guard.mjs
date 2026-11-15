@@ -97,7 +97,8 @@ export function options(env = process.env) {
     cutoffRetries: num("PI_GUARD_CUTOFF_RETRIES", 3),
     compactAt: Math.min(num("PI_GUARD_COMPACT_AT", 0.6), 1),
     profiles: env.PI_GUARD_PROFILE !== "off",
-    // reasoning_effort for gpt-oss when pi's thinking is off: low, medium, high, or "default" to send none
+    // reasoning_effort for gpt-oss when pi's thinking is off: low, medium, high, "default" to send none,
+    // or "auto": low until a tool runs in the request, then default
     gptOssEffort: env.PI_GUARD_GPT_OSS_EFFORT || "",
     // the working folder's files in the system prompt: "auto" (the model's profile decides), "on" or "off"
     listFiles: ["on", "off"].includes(env.PI_GUARD_LIST_FILES) ? env.PI_GUARD_LIST_FILES : "auto",
@@ -110,7 +111,7 @@ const callsOf = message => (message.content || []).filter(c => c?.type === "tool
 
 export function installLocalModelGuard(pi, opts = options(), { now = () => Date.now(), timers = globalThis } = {}) {
   const stats = { adjusted: 0, repaired: 0, nudged: 0, stalls: 0, loops: 0, stripped: 0, compacted: 0, stopped: 0, listed: 0, hinted: 0, cutoffs: 0 };
-  let cutoff = false, cutoffRetries = 0;
+  let cutoff = false, cutoffRetries = 0, worked = false;
   let nudges = 0, lastKind = null, resending = false, stalled = null, watch = null, timer = null, seq = 0;
   let thoughts = createReasoningWatch(), brokenJson = false, mutated = false, compacted = false;
 
@@ -127,18 +128,21 @@ export function installLocalModelGuard(pi, opts = options(), { now = () => Date.
   // A new request from the person resets the nudge budget; the guard's own follow-ups do not.
   pi.on("before_agent_start", () => {
     if (resending) resending = false;
-    else { nudges = 0; mutated = false; cutoffRetries = 0; }
+    else { nudges = 0; mutated = false; cutoffRetries = 0; worked = false; }
     lastKind = null;
   });
   pi.on("agent_start", () => { thoughts = createReasoningWatch(); brokenJson = false; compacted = false; });
-  pi.on("tool_execution_start", event => { if (!READS.has(event?.toolName)) mutated = true; });
+  pi.on("tool_execution_start", event => { worked = true; if (!READS.has(event?.toolName)) mutated = true; });
 
   pi.on("before_provider_request", (event, ctx) => {
     if (!event?.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return undefined;
     const thinking = ctx?.thinkingLevel ?? pi.getThinkingLevel?.();
     const fix = requestAdjustments({ provider: ctx?.model?.provider, model: ctx?.model?.id, thinking }) || { patch: {}, rules: [] };
     const profile = profileFor(ctx?.model?.id, opts);
-    const effort = profile && (opts.gptOssEffort || profile.effort);
+    let effort = profile && (opts.gptOssEffort || profile.effort);
+    // auto: quick replies think briefly; once a tool has run in this request it is real work,
+    // and the model gets its default effort (low lost 9/10 -> 5/10 on held-out agent tasks).
+    if (effort === "auto") effort = worked ? "default" : "low";
     if (effort && effort !== "default" && (thinking === "off" || thinking === false) && event.payload.reasoning_effort === undefined
         && fix.patch.reasoning_effort === undefined) {
       fix.patch = { ...fix.patch, reasoning_effort: effort };
