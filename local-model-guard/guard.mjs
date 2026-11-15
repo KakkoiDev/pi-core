@@ -26,8 +26,9 @@
 //    From rich-ai-chat's chat-attempt layer.
 // 9. Model profiles, switched on by model id (see PROFILES). gpt-oss: an opt-in reasoning effort when pi's
 //    thinking is off (PI_GUARD_GPT_OSS_EFFORT; pi sends none, so Ollama uses medium), the working folder's files in the system
-//    prompt (it opened every agentic-v1 task by reading "" as a file), and a hint when read is given
-//    a folder.
+//    prompt (it opened every agentic-v1 task by reading "" as a file), a hint when read is given
+//    a folder, and edit as one flat replacement (its broken JSON in the nested edits[] array is what
+//    Ollama drops, and what pi reports as "Stream ended without finish_reason").
 import { appendFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { classifyTurn, turnRecovery, parseTextToolCalls, createStallWatch, createReasoningWatch, requestAdjustments } from "@kakkoidev/ai-core";
@@ -41,6 +42,14 @@ const BROKEN_TOOL_JSON = /error parsing tool call:[\s\S]*(?:unexpected end of JS
 const CUT_OFF = /without finish_reason/i;
 const CUT_OFF_NUDGE = "Your last reply was cut off before any answer or tool call. Continue now: if you meant to use a tool, " +
   "call one of the available tools with valid JSON arguments; otherwise give the answer directly. Keep the reasoning short.";
+// On Ollama a cut-off is a tool call whose arguments failed to parse as JSON: the harmony parser rejects it
+// ("error parsing tool call: ... invalid character '}' after top-level value", most often one closing brace
+// too many after a nested edits[] array), and the /v1 endpoint drops that error, ending the stream with an
+// empty chunk. So the call never ran, and the model is told what went wrong.
+const OLLAMA_CUT_OFF_NUDGE = "Your last tool call did not run: its arguments were not valid JSON, so the server dropped it " +
+  "(usually one closing brace too many after a nested array, as in edit's edits[]). Call the tool again now with exactly one " +
+  "JSON object whose braces and brackets balance, and nothing after it. For edit, keep edits[] to one or two small entries.";
+export const cutOffNudge = ctx => /ollama/i.test(String(ctx?.model?.provider ?? "")) ? OLLAMA_CUT_OFF_NUDGE : CUT_OFF_NUDGE;
 const READS = new Set(["read", "grep", "find", "ls"]);
 const ENTRY = "local-model-guard";
 
@@ -55,8 +64,43 @@ export const PROFILES = [
     effort: null,
     listFiles: true,
     folderHint: true,
+    // edit offered as one flat replacement ({path, oldText, newText}), which pi's edit tool accepts as legacy input.
+    // The nested edits[] array is where gpt-oss writes broken JSON that Ollama drops (see OLLAMA_CUT_OFF_NUDGE).
+    flatEdit: true,
   },
 ];
+// The edit tool as one flat replacement, and the system prompt lines that describe edits[] rewritten to match.
+export const FLAT_EDIT = {
+  name: "edit",
+  description: "Edit a single file using exact text replacement: oldText must match a unique region of the file and is replaced by newText. One replacement per call; call edit again for another change.",
+  parameters: {
+    type: "object",
+    required: ["path", "oldText", "newText"],
+    properties: {
+      path: { type: "string", description: "Path to the file to edit (relative or absolute)" },
+      oldText: { type: "string", description: "Exact text to replace. It must be unique in the file." },
+      newText: { type: "string", description: "Replacement text." },
+    },
+  },
+};
+const FLAT_EDIT_PROMPT = [
+  [/^- edit: .*$/m, "- edit: Make one precise file edit with exact text replacement"],
+  [/edits\[\]\.oldText/g, "oldText"],
+  [/^- When changing multiple separate locations in one file, use one edit call with multiple entries in edits\[\].*\n/m, ""],
+  [/^- Each oldText is matched against the original file, not after earlier edits are applied\..*\n/m, ""],
+];
+/** The request with pi's nested edit tool replaced by FLAT_EDIT, or null when it has no such tool. */
+export function flattenEditTool(payload) {
+  const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+  const i = tools.findIndex(t => t?.type === "function" && t.function?.name === "edit" && t.function.parameters?.properties?.edits);
+  if (i < 0) return null;
+  const out = { ...payload, tools: tools.map((t, j) => j === i ? { ...t, function: { ...FLAT_EDIT, parameters: structuredClone(FLAT_EDIT.parameters) } } : t) };
+  if (Array.isArray(payload.messages)) {
+    out.messages = payload.messages.map(m => (m?.role === "system" || m?.role === "developer") && typeof m.content === "string"
+      ? { ...m, content: FLAT_EDIT_PROMPT.reduce((text, [from, to]) => text.replace(from, to), m.content) } : m);
+  }
+  return out;
+}
 export const profileFor = (model, opts = {}) => opts.profiles === false ? null : PROFILES.find(p => p.match(model)) || null;
 
 const SKIP = new Set([".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache", ".idea", ".vscode", "dist", "build"]);
@@ -101,6 +145,8 @@ export function options(env = process.env) {
     // or "auto": low until a tool runs in the request, then default
     gptOssEffort: env.PI_GUARD_GPT_OSS_EFFORT || "",
     // the working folder's files in the system prompt: "auto" (the model's profile decides), "on" or "off"
+    // edit as one flat replacement: "auto" (the model's profile decides), "on" or "off"
+    flatEdit: ["on", "off"].includes(env.PI_GUARD_FLAT_EDIT) ? env.PI_GUARD_FLAT_EDIT : "auto",
     listFiles: ["on", "off"].includes(env.PI_GUARD_LIST_FILES) ? env.PI_GUARD_LIST_FILES : "auto",
   };
 }
@@ -148,10 +194,15 @@ export function installLocalModelGuard(pi, opts = options(), { now = () => Date.
       fix.patch = { ...fix.patch, reasoning_effort: effort };
       fix.rules = [...fix.rules, `${profile.id}-effort-${effort}`];
     }
+    let payload = { ...event.payload, ...fix.patch };
+    if (opts.flatEdit === "on" || (opts.flatEdit === "auto" && profile?.flatEdit)) {
+      const flat = flattenEditTool(payload);
+      if (flat) { payload = flat; fix.rules = [...fix.rules, "flat-edit"]; }
+    }
     if (!fix.rules.length) return undefined;
     stats.adjusted++;
     record("adjusted", ctx, { rules: fix.rules });
-    return { ...event.payload, ...fix.patch };
+    return payload;
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -236,7 +287,7 @@ export function installLocalModelGuard(pi, opts = options(), { now = () => Date.
       if (cutoffRetries >= opts.cutoffRetries) { stats.stopped++; record("out-of-cutoff-retries", ctx, {}); return undefined; }
       cutoffRetries++; stats.cutoffs++;
       record("cutoff", ctx, { retry: cutoffRetries });
-      return { entries: [...(event.entries || []), { type: "custom_message", customType: ENTRY, content: CUT_OFF_NUDGE, display: true }], continue: true };
+      return { entries: [...(event.entries || []), { type: "custom_message", customType: ENTRY, content: cutOffNudge(ctx), display: true }], continue: true };
     }
     if (event?.outcome === "error" && brokenJson && opts.toolJsonRetry) {
       brokenJson = false;

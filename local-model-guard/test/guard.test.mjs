@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { installLocalModelGuard, options, listFolder, profileFor } from "../guard.mjs";
+import { installLocalModelGuard, options, listFolder, profileFor, cutOffNudge, flattenEditTool, FLAT_EDIT } from "../guard.mjs";
+import { readFileSync } from "node:fs";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -231,7 +232,7 @@ test("a cut-off reply (gpt-oss: thinking, then no finish reason) is continued at
     await emit("message_end", { message: cut }, ctx);
     const out = await settle(emit, { outcome: "error" });
     assert.equal(out.continue, true);
-    assert.match(out.entries.at(-1).content, /cut off before any answer or tool call/);
+    assert.match(out.entries.at(-1).content, /not valid JSON/, "on Ollama the note names the cause: tool JSON the server dropped");
   }
   await emit("message_end", { message: cut }, ctx);
   assert.equal(await settle(emit, { outcome: "error" }), undefined, "out of retries: pi's own handling takes over");
@@ -255,6 +256,12 @@ test("a cut-off reply (gpt-oss: thinking, then no finish reason) is continued at
   assert.equal(await settle(off.emit, { outcome: "error" }), undefined);
 });
 
+test("the cut-off note names broken tool JSON on Ollama, and stays generic elsewhere", async () => {
+  assert.match(cutOffNudge({ model: { provider: "ollama", id: "gpt-oss:20b" } }), /arguments were not valid JSON[\s\S]*one closing brace too many/);
+  for (const other of [{ model: { provider: "openrouter", id: "openai/gpt-oss-20b" } }, {}, undefined])
+    assert.match(cutOffNudge(other), /cut off before any answer or tool call/);
+});
+
 test("gpt-oss auto effort: low for a quick reply, default once a tool has run in the request", async () => {
   const oss = { ...ctx, model: { provider: "ollama", id: "gpt-oss:20b" } };
   const { pi, emit } = fakePi();
@@ -266,4 +273,40 @@ test("gpt-oss auto effort: low for a quick reply, default once a tool has run in
   assert.equal(after?.reasoning_effort, undefined, "default effort: none sent");
   await emit("before_agent_start"); // next request starts low again
   assert.equal((await emit("before_provider_request", { payload: { model: "gpt-oss:20b" } }, oss)).reasoning_effort, "low");
+});
+
+// A request pi 1.1.0 sent to Ollama for gpt-oss:20b (system prompt cut to its tools and rules).
+const piRequest = () => JSON.parse(readFileSync(new URL("./fixtures/pi-gpt-oss-request.json", import.meta.url), "utf8"));
+
+test("flattenEditTool offers edit as one flat replacement and rewrites the prompt lines about edits[]", () => {
+  const req = piRequest();
+  const flat = flattenEditTool(req);
+  const edit = flat.tools.find(t => t.function.name === "edit").function;
+  assert.deepEqual(edit.parameters.required, ["path", "oldText", "newText"]);
+  assert.equal(edit.parameters.properties.edits, undefined);
+  assert.deepEqual(flat.tools.map(t => t.function.name), ["read", "bash", "edit", "write"], "other tools and their order are kept");
+  const prompt = flat.messages[0].content;
+  assert.doesNotMatch(prompt, /edits\[\]/);
+  assert.match(prompt, /- edit: Make one precise file edit/);
+  assert.match(prompt, /- Use edit for precise changes \(oldText must match exactly\)/);
+  assert.match(prompt, /- Use write only for new files/, "unrelated rules are kept");
+  assert.equal(flat.messages[1].content, "Fix the bug.");
+  assert.ok(req.tools.find(t => t.function.name === "edit").function.parameters.properties.edits, "the input is not changed");
+  assert.equal(flattenEditTool(flat), null, "already flat");
+  assert.equal(flattenEditTool({ messages: [] }), null);
+  assert.equal(FLAT_EDIT.name, "edit");
+});
+
+test("gpt-oss requests get the flat edit tool; other models only with PI_GUARD_FLAT_EDIT=on, never with off", async () => {
+  const oss = { ...ctx, model: { provider: "ollama", id: "gpt-oss:20b" } };
+  const qwen = { ...ctx, model: { provider: "ollama", id: "qwen3.8:27b-mlx" } };
+  const editOf = payload => payload.tools.find(t => t.function.name === "edit").function.parameters;
+  const run = async (o, c) => { const { pi, emit } = fakePi(); installLocalModelGuard(pi, { ...opts, ...o }); return emit("before_provider_request", { payload: piRequest() }, c); };
+  assert.deepEqual(editOf(await run({}, oss)).required, ["path", "oldText", "newText"]);
+  assert.equal((await run({}, oss)).reasoning_effort, "low", "the rest of the payload is kept");
+  assert.equal(await run({}, qwen), undefined);
+  assert.deepEqual(editOf(await run({ flatEdit: "on" }, qwen)).required, ["path", "oldText", "newText"]);
+  assert.equal(await run({ flatEdit: "off" }, oss), undefined, "nothing else to change in this request");
+  assert.equal(options({ PI_GUARD_FLAT_EDIT: "off" }).flatEdit, "off");
+  assert.equal(options({}).flatEdit, "auto");
 });
